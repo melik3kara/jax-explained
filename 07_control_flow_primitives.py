@@ -115,18 +115,19 @@ def apply_activation_switch(index, x):
 
 
 def apply_activation_python(index, x):
-    # Karşılaştırma için: aynı mantığın saf Python match/case karşılığı.
-    match index:
-        case 0:
-            return x
-        case 1:
-            return max(x, 0.0)
-        case 2:
-            return x ** 2
-        case 3:
-            return 1.0 / (1.0 + math.exp(-x))
-        case _:
-            raise ValueError(f"Geçersiz index: {index}")
+    # Karşılaştırma için: aynı mantığın saf Python if/elif karşılığı.
+    # (match/case Python 3.10+ gerektirdiği için, geniş uyumluluk adına
+    # klasik if/elif zincirini tercih ediyoruz.)
+    if index == 0:
+        return x
+    elif index == 1:
+        return max(x, 0.0)
+    elif index == 2:
+        return x ** 2
+    elif index == 3:
+        return 1.0 / (1.0 + math.exp(-x))
+    else:
+        raise ValueError(f"Geçersiz index: {index}")
 
 
 def demo_switch():
@@ -139,7 +140,7 @@ def demo_switch():
 
     x = 2.0
     print(f"  Girdi x = {x}\n")
-    print(f"  {'index':<7}{'fonksiyon':<12}{'lax.switch':<14}{'Python match/case':<20}{'fark'}")
+    print(f"  {'index':<7}{'fonksiyon':<12}{'lax.switch':<14}{'Python if/elif':<20}{'fark'}")
     for idx in range(4):
         jax_result = float(jitted_switch(idx, jnp.array(x)).block_until_ready())
         py_result = apply_activation_python(idx, x)
