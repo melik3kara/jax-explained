@@ -83,48 +83,81 @@ jax_grad_fn = jax.jit(jax.grad(f))
 jax_hessian_fn = jax.jit(jax.jacfwd(jax.jacrev(f)))  # Hessian için standart JAX deseni
 
 
+# ---------------------------------------------------------------------------
+# Yardımcı: bu makinede bulunan JAX cihazlarını (CPU / GPU) tespit et.
+# GPU yoksa jax.devices("gpu") hata fırlatır; bunu sessizce yakalayıp atlıyoruz.
+# ---------------------------------------------------------------------------
+def get_available_devices() -> dict:
+    devices = {}
+    try:
+        devices["CPU"] = jax.devices("cpu")[0]
+    except RuntimeError:
+        pass
+    try:
+        devices["GPU"] = jax.devices("gpu")[0]
+    except RuntimeError:
+        pass
+    return devices
+
+
+# ---------------------------------------------------------------------------
+# Belirli bir cihazda gradyan+Hessian hesabını çalıştırır (warmup + ölçüm).
+# ÖNEMLİ: X0 modül seviyesinde bir kez oluşturulduğu için belirli bir cihaza
+# "commit" edilmiştir; sadece `jax.default_device` bağlamına girmek onu
+# BAŞKA bir cihaza TAŞIMAZ. Bu yüzden `jax.device_put(X0, device)` ile
+# diziyi HER cihaz için AÇIKÇA o cihaza kopyalıyoruz.
+# ---------------------------------------------------------------------------
+def run_on_device(device):
+    x0_dev = jax.device_put(X0, device)
+
+    _ = jax_grad_fn(x0_dev).block_until_ready()  # warmup
+    _ = jax_hessian_fn(x0_dev).block_until_ready()  # warmup
+
+    t0 = time.perf_counter()
+    grad_jax = jax_grad_fn(x0_dev).block_until_ready()
+    hess_jax = jax_hessian_fn(x0_dev).block_until_ready()
+    elapsed = time.perf_counter() - t0
+
+    return elapsed, grad_jax, hess_jax
+
+
 if __name__ == "__main__":
     print("=" * 62)
     print(" DENEY 4: Autodiff vs Sonlu Farklar (Gradyan & Hessian)")
     print("=" * 62)
-    print(f"  Kullanılan cihaz(lar): {jax.devices()}")
+
+    devices = get_available_devices()
+    print(f"  Bulunan cihazlar: {list(devices.keys())}")
 
     x_np = np.array(X0, dtype=np.float64)
 
-    # --- NumPy: sonlu farklar ---
+    # --- Referans: NumPy sonlu farklar (cihazdan bağımsız, bir kez ölçülür) ---
     t0 = time.perf_counter()
     grad_numerical = numerical_gradient(x_np)
     hess_numerical = numerical_hessian(x_np)
-    t1 = time.perf_counter()
-    numerical_time = t1 - t0
-
-    # --- JAX: warmup (derleme) + gerçek ölçüm ---
-    _ = jax_grad_fn(X0).block_until_ready()
-    _ = jax_hessian_fn(X0).block_until_ready()
-
-    t0 = time.perf_counter()
-    grad_jax = jax_grad_fn(X0).block_until_ready()
-    hess_jax = jax_hessian_fn(X0).block_until_ready()
-    t1 = time.perf_counter()
-    jax_time = t1 - t0
-
-    grad_diff = float(np.max(np.abs(grad_numerical - np.asarray(grad_jax))))
-    hess_diff = float(np.max(np.abs(hess_numerical - np.asarray(hess_jax))))
+    numerical_time = time.perf_counter() - t0
 
     print("\nGradyan (df/dx0, df/dx1, df/dx2):")
     print(f"  Sonlu Farklar : {grad_numerical}")
-    print(f"  jax.grad      : {np.asarray(grad_jax)}")
-    print(f"  Maks. fark    : {grad_diff:.2e}")
 
-    print("\nHessian matrisi:")
-    print("  Sonlu Farklar :")
+    print("\nHessian matrisi (Sonlu Farklar):")
     print("   ", str(hess_numerical).replace("\n", "\n    "))
-    print("  jacfwd(jacrev(f)) :")
-    print("   ", str(np.asarray(hess_jax)).replace("\n", "\n    "))
-    print(f"  Maks. fark    : {hess_diff:.2e}")
 
-    print(f"\nSüre (gradyan + Hessian, warmup sonrası):")
-    print(f"  NumPy Sonlu Farklar : {numerical_time*1000:>10.2f} ms")
-    print(f"  JAX Autodiff        : {jax_time*1000:>10.2f} ms")
-    print(f"  Hızlanma            : {numerical_time / jax_time:.1f}x")
+    print(f"\n  NumPy Sonlu Farklar süresi: {numerical_time*1000:.2f} ms")
+
+    # --- Her bulunan cihazda (CPU, varsa GPU) JAX autodiff çalıştır ---
+    for name, device in devices.items():
+        jax_time, grad_jax, hess_jax = run_on_device(device)
+
+        grad_diff = float(np.max(np.abs(grad_numerical - np.asarray(grad_jax))))
+        hess_diff = float(np.max(np.abs(hess_numerical - np.asarray(hess_jax))))
+
+        print(f"\n  --- {name} ---")
+        print(f"  jax.grad      : {np.asarray(grad_jax)}  (fark: {grad_diff:.2e})")
+        print("  jacfwd(jacrev(f)) :")
+        print("   ", str(np.asarray(hess_jax)).replace("\n", "\n    "))
+        print(f"  Hessian maks. fark : {hess_diff:.2e}")
+        print(f"  JAX Autodiff süresi [{name}] : {jax_time*1000:.2f} ms")
+        print(f"  Hızlanma (NumPy'a göre)      : {numerical_time / jax_time:.1f}x")
+
     print("=" * 62)

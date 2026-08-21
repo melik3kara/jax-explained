@@ -20,28 +20,26 @@ pip install -r requirements.txt
 > ```bash
 > pip install -U "jax[cuda12]"
 > ```
-> Script çalıştığında hangi cihazı kullandığını görmek için Python'da
-> `import jax; print(jax.devices())` komutunu kontrol edebilirsiniz. Her deney
-> dosyası zaten başlangıçta "Kullanılan cihaz(lar): ..." satırını otomatik basar.
 
-### Aynı makinede hem CPU hem GPU ile çalıştırmak
+### Aynı makinede hem CPU hem GPU sonucu — tek çalıştırmada, otomatik
 
-`pip install -U "jax[cuda12]"` ile kurulan **tek bir** jax paketi hem CPU hem
-GPU'yu destekler — iki ayrı kurulum gerekmez. JAX varsayılan olarak GPU'yu
-görürse onu kullanır. CPU ile GPU'yu aynı makinede kıyaslamak için, hangi
-backend'in kullanılacağını `JAX_PLATFORMS` ortam değişkeniyle zorlayabilirsiniz
-(kod değişikliği gerekmez):
+Ekstra bir ayar veya ortam değişkeni gerekmez: her deney dosyası çalışırken
+kendi içinde `jax.devices("cpu")` ve `jax.devices("gpu")` ile bu makinede
+neler bulunduğunu otomatik tespit eder ve JAX'e ait tüm bölümleri **her
+bulunan cihazda ayrı ayrı** çalıştırıp sonuçları tek çıktıda yan yana basar
+(`jax.device_put(...)` / `jax.default_device(...)` ile). Yani IDE'de sadece
+▶️ **Run** tuşuna basmanız yeterli:
 
-```bash
-# GPU var ama yine de CPU'da çalıştırmak için:
-JAX_PLATFORMS=cpu python 02_kernel_fusion.py
+- Sadece CPU'lu bir makinede çalıştırırsanız çıktıda `Bulunan cihazlar: ['CPU']`
+  görürsünüz, sonuçlar tek bölüm halinde gelir.
+- CUDA'lı bir GPU'nun olduğu makinede çalıştırırsanız `Bulunan cihazlar: ['CPU', 'GPU']`
+  görürsünüz ve her deney CPU ile GPU sonuçlarını art arda, aynı çalıştırmada
+  gösterir — script'i tekrar çalıştırmanıza veya ortam değişkeni ayarlamanıza
+  gerek kalmaz.
 
-# GPU'da çalıştırmak için (GPU'lu jaxlib kuruluysa, genelde zaten varsayılan):
-JAX_PLATFORMS=cuda python 02_kernel_fusion.py
-```
-
-Her iki komutu art arda çalıştırıp üstteki "Kullanılan cihaz(lar):" satırı ile
-hızlanma tablosunu karşılaştırarak GPU'nun gerçek katkısını görebilirsiniz.
+(İsterseniz yine de belirli bir backend'i zorlamak isteyebilirsiniz — örn.
+GPU'lu bir makinede GPU'yu görmezden gelmek için `JAX_PLATFORMS=cpu python 01_loop_benchmark.py`
+gibi. Ama günlük kullanım için bu gerekmez.)
 
 ## Çalıştırma
 

@@ -68,40 +68,72 @@ def print_row(label: str, seconds: float, result: float) -> None:
     print(f"  {label:<32} {seconds*1000:>10.2f} ms   sonuç = {result:.6f}")
 
 
+# ---------------------------------------------------------------------------
+# Yardımcı: bu makinede bulunan JAX cihazlarını (CPU / GPU) tespit et.
+# GPU yoksa jax.devices("gpu") hata fırlatır; bunu sessizce yakalayıp atlıyoruz.
+# ---------------------------------------------------------------------------
+def get_available_devices() -> dict:
+    devices = {}
+    try:
+        devices["CPU"] = jax.devices("cpu")[0]
+    except RuntimeError:
+        pass
+    try:
+        devices["GPU"] = jax.devices("gpu")[0]
+    except RuntimeError:
+        pass
+    return devices
+
+
+# ---------------------------------------------------------------------------
+# Belirli bir cihazda fori_loop ve scan'i çalıştırıp (warmup + ölçüm) süreleri döndürür.
+# `jax.default_device` bloğu içinde oluşturulan/çalıştırılan her şey o cihazda çalışır.
+# ---------------------------------------------------------------------------
+def run_on_device(device) -> dict:
+    with jax.default_device(device):
+        _ = jax_fori_loop(N_STEPS, DT).block_until_ready()  # warmup
+        t0 = time.perf_counter()
+        fori_result = jax_fori_loop(N_STEPS, DT).block_until_ready()
+        fori_time = time.perf_counter() - t0
+
+        _ = jax_scan_loop(N_STEPS, DT).block_until_ready()  # warmup
+        t0 = time.perf_counter()
+        scan_result = jax_scan_loop(N_STEPS, DT).block_until_ready()
+        scan_time = time.perf_counter() - t0
+
+    return {
+        "fori_time": fori_time, "fori_result": float(fori_result),
+        "scan_time": scan_time, "scan_result": float(scan_result),
+    }
+
+
 if __name__ == "__main__":
     print("=" * 62)
     print(" DENEY 1: Döngü Karşılaştırması (1.000.000 adım)")
     print("=" * 62)
-    print(f"  Kullanılan cihaz(lar): {jax.devices()}")
 
-    # --- 1) Saf Python ---
+    devices = get_available_devices()
+    print(f"  Bulunan cihazlar: {list(devices.keys())}")
+
+    # --- Referans: Saf Python (cihazdan bağımsız, bir kez ölçülür) ---
     t0 = time.perf_counter()
     py_result = python_for_loop(N_STEPS, DT)
-    t1 = time.perf_counter()
-    py_time = t1 - t0
-
-    # --- 2) fori_loop: warmup (derleme) + gerçek ölçüm ---
-    _ = jax_fori_loop(N_STEPS, DT).block_until_ready()  # warmup, süresi sayılmaz
-
-    t0 = time.perf_counter()
-    fori_result = jax_fori_loop(N_STEPS, DT).block_until_ready()
-    t1 = time.perf_counter()
-    fori_time = t1 - t0
-
-    # --- 3) scan: warmup (derleme) + gerçek ölçüm ---
-    _ = jax_scan_loop(N_STEPS, DT).block_until_ready()  # warmup, süresi sayılmaz
-
-    t0 = time.perf_counter()
-    scan_result = jax_scan_loop(N_STEPS, DT).block_until_ready()
-    t1 = time.perf_counter()
-    scan_time = t1 - t0
+    py_time = time.perf_counter() - t0
 
     print("\nSonuçlar (warmup sonrası, saf çalışma süresi):\n")
     print_row("Python for döngüsü", py_time, py_result)
-    print_row("jax.lax.fori_loop", fori_time, float(fori_result))
-    print_row("jax.lax.scan", scan_time, float(scan_result))
+
+    # --- Her bulunan cihazda (CPU, varsa GPU) fori_loop ve scan'i çalıştır ---
+    device_results = {}
+    for name, device in devices.items():
+        print(f"\n  --- {name} ---")
+        r = run_on_device(device)
+        device_results[name] = r
+        print_row(f"jax.lax.fori_loop [{name}]", r["fori_time"], r["fori_result"])
+        print_row(f"jax.lax.scan [{name}]", r["scan_time"], r["scan_result"])
 
     print("\nHızlanma (Python'a göre):")
-    print(f"  fori_loop : {py_time / fori_time:>8.1f}x daha hızlı")
-    print(f"  scan      : {py_time / scan_time:>8.1f}x daha hızlı")
+    for name, r in device_results.items():
+        print(f"  [{name}] fori_loop : {py_time / r['fori_time']:>8.1f}x daha hızlı")
+        print(f"  [{name}] scan      : {py_time / r['scan_time']:>8.1f}x daha hızlı")
     print("=" * 62)

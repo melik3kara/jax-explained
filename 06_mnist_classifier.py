@@ -179,11 +179,73 @@ def batch_indices(n_samples, batch_size, rng):
         yield perm[i * batch_size:(i + 1) * batch_size]
 
 
+# ---------------------------------------------------------------------------
+# Yardımcı: bu makinede bulunan JAX cihazlarını (CPU / GPU) tespit et.
+# GPU yoksa jax.devices("gpu") hata fırlatır; bunu sessizce yakalayıp atlıyoruz.
+# ---------------------------------------------------------------------------
+def get_available_devices() -> dict:
+    devices = {}
+    try:
+        devices["CPU"] = jax.devices("cpu")[0]
+    except RuntimeError:
+        pass
+    try:
+        devices["GPU"] = jax.devices("gpu")[0]
+    except RuntimeError:
+        pass
+    return devices
+
+
+# ---------------------------------------------------------------------------
+# Belirli bir cihazda tam JAX eğitim döngüsünü (5 epoch) çalıştırır.
+# `jax.device_put` ile ağırlıkları ve veriyi AÇIKÇA o cihaza taşıyoruz;
+# aksi halde önceden oluşturulmuş diziler "commit" edildikleri ilk cihazda
+# kalmaya devam eder.
+# ---------------------------------------------------------------------------
+def run_jax_training(device, name, init, x_train, y_train_onehot, x_test, y_test_labels):
+    params_jax = jax.device_put(init, device)
+    x_train_jax = jax.device_put(x_train, device)
+    y_train_onehot_jax = jax.device_put(y_train_onehot, device)
+    x_test_jax = jax.device_put(x_test, device)
+    y_test_labels_jax = jax.device_put(y_test_labels, device)
+
+    # --- warmup: ilk çağrı derlemeyi (tracing/compilation) içerir, süresi sayılmaz ---
+    first_batch = jax.device_put(jnp.arange(BATCH_SIZE), device)
+    warm_params, warm_loss = train_step_jax(
+        params_jax, x_train_jax[first_batch], y_train_onehot_jax[first_batch], LEARNING_RATE
+    )
+    jax.block_until_ready((warm_params, warm_loss))
+    jax.block_until_ready(accuracy_jax(params_jax, x_test_jax, y_test_labels_jax))
+
+    epoch_rng = np.random.default_rng(1)  # NumPy ile AYNI batch sırası
+
+    t0 = time.perf_counter()
+    for epoch in range(EPOCHS):
+        epoch_loss = 0.0
+        n_batches = 0
+        for idx in batch_indices(N_TRAIN, BATCH_SIZE, epoch_rng):
+            idx_jax = jax.device_put(idx, device)
+            params_jax, batch_loss = train_step_jax(
+                params_jax, x_train_jax[idx_jax], y_train_onehot_jax[idx_jax], LEARNING_RATE
+            )
+            epoch_loss += float(batch_loss)
+            n_batches += 1
+        test_acc = float(accuracy_jax(params_jax, x_test_jax, y_test_labels_jax))
+        print(f"  [{name}] Epoch {epoch+1}/{EPOCHS}  loss={epoch_loss/n_batches:.4f}  test_acc={test_acc*100:.2f}%")
+    jax.block_until_ready(params_jax)
+    elapsed = time.perf_counter() - t0
+    final_acc = float(accuracy_jax(params_jax, x_test_jax, y_test_labels_jax))
+
+    return elapsed, final_acc
+
+
 if __name__ == "__main__":
     print("=" * 62)
     print(" DENEY 6 (Bonus): Basit MNIST Sınıflandırma")
     print("=" * 62)
-    print(f"  Kullanılan cihaz(lar): {jax.devices()}")
+
+    devices = get_available_devices()
+    print(f"  Bulunan cihazlar: {list(devices.keys())}")
 
     (x_train_full, y_train_full), (x_test_full, y_test_full) = load_mnist()
 
@@ -225,45 +287,17 @@ if __name__ == "__main__":
     numpy_final_acc = accuracy_np(params_np, x_test, y_test_labels)
 
     # =======================================================================
-    # 2) JAX ile eğitim (otomatik türev + jit)
+    # 2) JAX ile eğitim (otomatik türev + jit) — bulunan HER cihazda
     # =======================================================================
-    print("\n" + "-" * 62)
-    print("  [2] JAX (jax.grad + @jax.jit)")
-    print("-" * 62)
-
-    params_jax = {k: jnp.asarray(v) for k, v in init.items()}
-    x_train_jax = jnp.asarray(x_train)
-    y_train_onehot_jax = jnp.asarray(y_train_onehot)
-    x_test_jax = jnp.asarray(x_test)
-    y_test_labels_jax = jnp.asarray(y_test_labels)
-
-    # --- warmup: ilk çağrı derlemeyi (tracing/compilation) içerir, süresi sayılmaz ---
-    first_batch = jnp.arange(BATCH_SIZE)
-    warm_params, warm_loss = train_step_jax(
-        params_jax, x_train_jax[first_batch], y_train_onehot_jax[first_batch], LEARNING_RATE
-    )
-    jax.block_until_ready((warm_params, warm_loss))
-    jax.block_until_ready(accuracy_jax(params_jax, x_test_jax, y_test_labels_jax))
-
-    epoch_rng = np.random.default_rng(1)  # NumPy ile AYNI batch sırası
-
-    t0 = time.perf_counter()
-    for epoch in range(EPOCHS):
-        epoch_loss = 0.0
-        n_batches = 0
-        for idx in batch_indices(N_TRAIN, BATCH_SIZE, epoch_rng):
-            idx_jax = jnp.asarray(idx)
-            params_jax, batch_loss = train_step_jax(
-                params_jax, x_train_jax[idx_jax], y_train_onehot_jax[idx_jax], LEARNING_RATE
-            )
-            epoch_loss += float(batch_loss)
-            n_batches += 1
-        test_acc = float(accuracy_jax(params_jax, x_test_jax, y_test_labels_jax))
-        print(f"  Epoch {epoch+1}/{EPOCHS}  loss={epoch_loss/n_batches:.4f}  test_acc={test_acc*100:.2f}%")
-    jax.block_until_ready(params_jax)
-    t1 = time.perf_counter()
-    jax_time = t1 - t0
-    jax_final_acc = float(accuracy_jax(params_jax, x_test_jax, y_test_labels_jax))
+    device_results = {}
+    for name, device in devices.items():
+        print("\n" + "-" * 62)
+        print(f"  [2] JAX (jax.grad + @jax.jit) — {name}")
+        print("-" * 62)
+        elapsed, final_acc = run_jax_training(
+            device, name, init, x_train, y_train_onehot, x_test, y_test_labels
+        )
+        device_results[name] = (elapsed, final_acc)
 
     # =======================================================================
     # Özet
@@ -273,17 +307,26 @@ if __name__ == "__main__":
     print("=" * 62)
     print(f"  {'Yöntem':<32}{'Süre':>12}{'Test Doğruluğu':>18}")
     print(f"  {'NumPy (elle backprop)':<32}{numpy_time:>10.2f} s{numpy_final_acc*100:>16.2f}%")
-    print(f"  {'JAX (grad + jit)':<32}{jax_time:>10.2f} s{jax_final_acc*100:>16.2f}%")
-    print(f"\n  Hızlanma (NumPy'a göre): {numpy_time / jax_time:.1f}x")
+    for name, (elapsed, final_acc) in device_results.items():
+        label = f"JAX (grad + jit) [{name}]"
+        print(f"  {label:<32}{elapsed:>10.2f} s{final_acc*100:>16.2f}%")
 
-    if jax_time > numpy_time:
+    print("\n  Hızlanma (NumPy'a göre):")
+    slow_devices = []
+    for name, (elapsed, _) in device_results.items():
+        print(f"    [{name}] : {numpy_time / elapsed:.1f}x")
+        if elapsed > numpy_time:
+            slow_devices.append(name)
+
+    if slow_devices:
         print(
-            "\n  Not: JAX burada NumPy'dan YAVAŞ çıkabilir — bu bir hata değil, önemli\n"
-            "  bir ders! Batch boyutu (100) çok küçük olduğundan, her adımdaki asıl\n"
-            "  hesaplama ucuz kalıyor; buna karşılık Python döngüsünde her batch için\n"
-            "  ayrı bir jit çağrısı dispatch etme ve host<->device veri transferi\n"
-            "  maliyeti, kazanılan hesaplama zamanını aşıyor. JIT/JAX; büyük batch'lerde,\n"
-            "  GPU/TPU'da veya tüm epoch döngüsü tek bir `jax.lax.scan` ile derlenip\n"
-            "  Python dispatch'i tamamen ortadan kaldırıldığında asıl avantajını gösterir."
+            f"\n  Not: JAX [{', '.join(slow_devices)}] burada NumPy'dan YAVAŞ çıkabilir —\n"
+            "  bu bir hata değil, önemli bir ders! Batch boyutu (100) çok küçük\n"
+            "  olduğundan, her adımdaki asıl hesaplama ucuz kalıyor; buna karşılık\n"
+            "  Python döngüsünde her batch için ayrı bir jit çağrısı dispatch etme ve\n"
+            "  host<->device veri transferi maliyeti, kazanılan hesaplama zamanını\n"
+            "  aşıyor. JIT/JAX; büyük batch'lerde, GPU/TPU'da veya tüm epoch döngüsü\n"
+            "  tek bir `jax.lax.scan` ile derlenip Python dispatch'i tamamen ortadan\n"
+            "  kaldırıldığında asıl avantajını gösterir."
         )
     print("=" * 62)

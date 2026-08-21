@@ -253,16 +253,43 @@ def demo_vmap_control_flow():
         print(f"    index={idx} ({ACTIVATION_NAMES[idx]:<7}) x={x_val:>5.1f} -> {y_val:.4f}")
 
 
+# ---------------------------------------------------------------------------
+# Yardımcı: bu makinede bulunan JAX cihazlarını (CPU / GPU) tespit et.
+# GPU yoksa jax.devices("gpu") hata fırlatır; bunu sessizce yakalayıp atlıyoruz.
+# ---------------------------------------------------------------------------
+def get_available_devices() -> dict:
+    devices = {}
+    try:
+        devices["CPU"] = jax.devices("cpu")[0]
+    except RuntimeError:
+        pass
+    try:
+        devices["GPU"] = jax.devices("gpu")[0]
+    except RuntimeError:
+        pass
+    return devices
+
+
 if __name__ == "__main__":
     print("=" * 62)
     print(" DENEY 7: JAX İleri Seviye Kontrol Akışı Primitifleri")
     print("=" * 62)
-    print(f"  Kullanılan cihaz(lar): {jax.devices()}")
 
-    demo_cond()
-    demo_switch()
-    demo_while_loop()
-    demo_vmap_control_flow()
+    devices = get_available_devices()
+    print(f"  Bulunan cihazlar: {list(devices.keys())}")
+
+    # Her 4 demo da içeride TAZE diziler oluşturuyor (önceden "commit" edilmiş
+    # bir dizi yok), bu yüzden `jax.default_device` bağlamı tek başına yeterli:
+    # bağlam içinde oluşturulan her şey doğrudan o cihaza yerleşir.
+    for name, device in devices.items():
+        print(f"\n{'#' * 62}")
+        print(f"# CİHAZ: {name}")
+        print(f"{'#' * 62}")
+        with jax.default_device(device):
+            demo_cond()
+            demo_switch()
+            demo_while_loop()
+            demo_vmap_control_flow()
 
     print("\n" + "=" * 62)
     print(" Özet:")

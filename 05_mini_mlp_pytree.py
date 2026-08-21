@@ -74,11 +74,58 @@ def train_step(params, x, y):
     return new_params, loss
 
 
+# ---------------------------------------------------------------------------
+# Yardımcı: bu makinede bulunan JAX cihazlarını (CPU / GPU) tespit et.
+# GPU yoksa jax.devices("gpu") hata fırlatır; bunu sessizce yakalayıp atlıyoruz.
+# ---------------------------------------------------------------------------
+def get_available_devices() -> dict:
+    devices = {}
+    try:
+        devices["CPU"] = jax.devices("cpu")[0]
+    except RuntimeError:
+        pass
+    try:
+        devices["GPU"] = jax.devices("gpu")[0]
+    except RuntimeError:
+        pass
+    return devices
+
+
+# ---------------------------------------------------------------------------
+# Belirli bir cihazda tek eğitim adımını çalıştırır (warmup + ölçüm).
+# ÖNEMLİ: params/X/Y bir kez, döngüden ÖNCE oluşturulduğu için belirli bir
+# cihaza "commit" edilmiştir. `jax.device_put` bir Pytree'yi (params gibi
+# iç içe dict) TEK ÇAĞRIDA hedef cihaza kopyalar; bu yüzden her cihaz için
+# veriyi açıkça o cihaza taşıyoruz.
+# ---------------------------------------------------------------------------
+def run_on_device(device, params, X, Y):
+    params_dev = jax.device_put(params, device)
+    X_dev = jax.device_put(X, device)
+    Y_dev = jax.device_put(Y, device)
+
+    warm_params, warm_loss = train_step(params_dev, X_dev, Y_dev)  # warmup
+    jax.block_until_ready((warm_params, warm_loss))
+
+    t0 = time.perf_counter()
+    new_params, _ = train_step(params_dev, X_dev, Y_dev)
+    jax.block_until_ready(new_params)
+    step_time = time.perf_counter() - t0
+
+    # loss_after_step (train_step'in döndürdüğü), GÜNCELLEMEDEN ÖNCEKİ (eski)
+    # ağırlıklarla hesaplanır (jax.value_and_grad böyle çalışır); güncelleme
+    # sonrası gerçek kaybı görmek için yeni ağırlıklarla tekrar hesaplıyoruz.
+    loss_after_update = float(loss_fn(new_params, X_dev, Y_dev))
+
+    return step_time, loss_after_update
+
+
 if __name__ == "__main__":
     print("=" * 62)
     print(" DENEY 5: Pytree ile Saf Fonksiyonel Eğitim Adımı")
     print("=" * 62)
-    print(f"  Kullanılan cihaz(lar): {jax.devices()}")
+
+    devices = get_available_devices()
+    print(f"  Bulunan cihazlar: {list(devices.keys())}")
 
     key = jax.random.PRNGKey(0)
     key, params_key, data_key = jax.random.split(key, 3)
@@ -95,25 +142,15 @@ if __name__ == "__main__":
     for name, value in params.items():
         print(f"  {name:<4} : shape={value.shape}")
 
-    # --- warmup: ilk çağrı derlemeyi (tracing/compilation) içerir ---
-    warm_params, warm_loss = train_step(params, X, Y)
-    jax.block_until_ready((warm_params, warm_loss))
-
     initial_loss = float(loss_fn(params, X, Y))
+    print(f"\nBaşlangıç kaybı (loss): {initial_loss:.6f}")
 
-    # --- gerçek ölçüm: sadece derlenmiş fonksiyonun çalışma süresi ---
-    t0 = time.perf_counter()
-    new_params, loss_after_step = train_step(params, X, Y)
-    jax.block_until_ready((new_params, loss_after_step))
-    t1 = time.perf_counter()
-    step_time = t1 - t0
+    # --- Her bulunan cihazda (CPU, varsa GPU) tek eğitim adımını çalıştır ---
+    for name, device in devices.items():
+        step_time, loss_after_update = run_on_device(device, params, X, Y)
 
-    # loss_after_step, GÜNCELLEMEDEN ÖNCEKİ (eski) ağırlıklarla hesaplanan kayıptır
-    # (jax.value_and_grad böyle çalışır); güncelleme sonrası gerçek kaybı görmek için
-    # yeni ağırlıklarla (new_params) tekrar hesaplıyoruz.
-    loss_after_update = float(loss_fn(new_params, X, Y))
+        print(f"\n  --- {name} ---")
+        print(f"  1 adım sonrası kayıp (loss)    : {loss_after_update:.6f}")
+        print(f"  Tek eğitim adımı süresi [{name}] : {step_time*1000:.3f} ms  (jit sonrası)")
 
-    print(f"\nBaşlangıç kaybı (loss)        : {initial_loss:.6f}")
-    print(f"1 adım sonrası kayıp (loss)   : {loss_after_update:.6f}")
-    print(f"Tek eğitim adımı süresi       : {step_time*1000:.3f} ms  (jit sonrası)")
     print("=" * 62)
