@@ -87,6 +87,7 @@ if __name__ == "__main__":
     print("=" * 62)
     print(" DENEY 4: Autodiff vs Sonlu Farklar (Gradyan & Hessian)")
     print("=" * 62)
+    print(f"  Kullanılan cihaz(lar): {jax.devices()}")
 
     x_np = np.array(X0, dtype=np.float64)
 

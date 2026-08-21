@@ -257,6 +257,7 @@ if __name__ == "__main__":
     print("=" * 62)
     print(" DENEY 7: JAX İleri Seviye Kontrol Akışı Primitifleri")
     print("=" * 62)
+    print(f"  Kullanılan cihaz(lar): {jax.devices()}")
 
     demo_cond()
     demo_switch()

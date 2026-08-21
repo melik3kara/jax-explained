@@ -71,6 +71,7 @@ if __name__ == "__main__":
     print("=" * 62)
     print(f" DENEY 3: vmap ile Otomatik Vektörleştirme ({N_POINTS:,} nokta)".replace(",", "."))
     print("=" * 62)
+    print(f"  Kullanılan cihaz(lar): {jax.devices()}")
 
     rng = np.random.default_rng(0)
     X_np = rng.random((N_POINTS, 2))

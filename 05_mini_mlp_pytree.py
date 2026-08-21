@@ -78,6 +78,7 @@ if __name__ == "__main__":
     print("=" * 62)
     print(" DENEY 5: Pytree ile Saf Fonksiyonel Eğitim Adımı")
     print("=" * 62)
+    print(f"  Kullanılan cihaz(lar): {jax.devices()}")
 
     key = jax.random.PRNGKey(0)
     key, params_key, data_key = jax.random.split(key, 3)

@@ -183,6 +183,7 @@ if __name__ == "__main__":
     print("=" * 62)
     print(" DENEY 6 (Bonus): Basit MNIST Sınıflandırma")
     print("=" * 62)
+    print(f"  Kullanılan cihaz(lar): {jax.devices()}")
 
     (x_train_full, y_train_full), (x_test_full, y_test_full) = load_mnist()
 

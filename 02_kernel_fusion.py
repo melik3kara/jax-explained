@@ -42,6 +42,7 @@ if __name__ == "__main__":
     print("=" * 62)
     print(f" DENEY 2: Kernel Fusion Kıyaslaması ({N:,} eleman)".replace(",", "."))
     print("=" * 62)
+    print(f"  Kullanılan cihaz(lar): {jax.devices()}")
 
     rng = np.random.default_rng(42)
     A_np = rng.random(N, dtype=np.float64)

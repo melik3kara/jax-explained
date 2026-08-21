@@ -21,7 +21,27 @@ pip install -r requirements.txt
 > pip install -U "jax[cuda12]"
 > ```
 > Script çalıştığında hangi cihazı kullandığını görmek için Python'da
-> `import jax; print(jax.devices())` komutunu kontrol edebilirsiniz.
+> `import jax; print(jax.devices())` komutunu kontrol edebilirsiniz. Her deney
+> dosyası zaten başlangıçta "Kullanılan cihaz(lar): ..." satırını otomatik basar.
+
+### Aynı makinede hem CPU hem GPU ile çalıştırmak
+
+`pip install -U "jax[cuda12]"` ile kurulan **tek bir** jax paketi hem CPU hem
+GPU'yu destekler — iki ayrı kurulum gerekmez. JAX varsayılan olarak GPU'yu
+görürse onu kullanır. CPU ile GPU'yu aynı makinede kıyaslamak için, hangi
+backend'in kullanılacağını `JAX_PLATFORMS` ortam değişkeniyle zorlayabilirsiniz
+(kod değişikliği gerekmez):
+
+```bash
+# GPU var ama yine de CPU'da çalıştırmak için:
+JAX_PLATFORMS=cpu python 02_kernel_fusion.py
+
+# GPU'da çalıştırmak için (GPU'lu jaxlib kuruluysa, genelde zaten varsayılan):
+JAX_PLATFORMS=cuda python 02_kernel_fusion.py
+```
+
+Her iki komutu art arda çalıştırıp üstteki "Kullanılan cihaz(lar):" satırı ile
+hızlanma tablosunu karşılaştırarak GPU'nun gerçek katkısını görebilirsiniz.
 
 ## Çalıştırma
 

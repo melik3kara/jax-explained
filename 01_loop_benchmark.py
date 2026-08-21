@@ -72,6 +72,7 @@ if __name__ == "__main__":
     print("=" * 62)
     print(" DENEY 1: Döngü Karşılaştırması (1.000.000 adım)")
     print("=" * 62)
+    print(f"  Kullanılan cihaz(lar): {jax.devices()}")
 
     # --- 1) Saf Python ---
     t0 = time.perf_counter()
