@@ -82,12 +82,32 @@ bloğuna bakınız — sebebi genelde per-batch Python dispatch maliyetidir).
         başlanır, GPU'ya taşınır, 5 epoch eğitilir, son doğruluk host'a geri
         getirilir (tam round-trip).
     Bu iki sonuç birbirine KARIŞTIRILMAZ.
+  - ÖNEMLİ (torch.compile'a özgü): model, optimizer ve derlenmiş training-step
+    SARMALAYICISI tekrarlar boyunca YENİDEN OLUŞTURULMAZ; aynı nesneler yeniden
+    kullanılır. `torch.compile` guard'ları `model`/`optimizer` nesne kimliğine
+    (`check_obj_id`) bakar; her round-trip'te yeni bir optimizer üretilirse guard
+    düşer, Dynamo aynı frame'i tekrar tekrar derler ve `recompile_limit` aşılınca
+    eager fallback'e düşerek "compiled" ölçümünü SESSİZCE kirletir. Bunun yerine
+    end-to-end tekrarında yalnızca (i) veri host'tan cihaza kopyalanır ve (ii)
+    pristine ağırlıklar HOST'tan `load_state_dict` ile MEVCUT cihaz modeline
+    yüklenir (gerçek host->device transferi; `load_state_dict` var olan tensörlere
+    `.copy_()` yapar, yeni parametre nesnesi OLUŞTURMAZ). Böylece round-trip
+    semantiği AYNEN korunur ama yeniden derleme tetiklenmez. Doğrulamak için:
+        TORCH_LOGS=recompiles python 06_mnist_classifier.py
+    (Uyarıyı `torch._dynamo.config.recompile_limit` ile gizlemek bir çözüm
+    DEĞİLDİR; asıl guard sebebi ortadan kaldırılmıştır.)
   - Veri yükleme (MNIST indirme), ön işleme ve rastgele ağırlık üretimi
     hiçbir ölçüme dahil DEĞİLDİR.
   - NOT: PyTorch'un GPU tespiti (`torch.cuda.is_available()`) ile JAX'in GPU
     tespiti BİRBİRİNDEN BAĞIMSIZDIR (farklı kütüphaneler, farklı backend
     derlemeleri); bu yüzden biri GPU görüp diğeri görmeyebilir. Çıktıda
     "PyTorch GPU" ve "Flax/JAX GPU" ayrı ayrı etiketlenir.
+
+Not (TF32): CUDA GPU'larında PyTorch, float32 matmul'ler için TF32 tensor
+core'larının "mevcut ama etkin değil" olduğunu söyleyen bir uyarı basabilir. Bu
+bir hata/correctness uyarısı değil, performans önerisidir. NumPy/JAX ile adil
+kıyas bozulmasın diye `torch.set_float32_matmul_precision` ÇAĞRILMAZ; PyTorch'un
+varsayılan float32 matmul hassasiyeti KORUNUR.
 
 Not: İlk çalıştırmada MNIST verisi (~11 MB) internetten indirilip
 `.mnist_cache/` klasörüne kaydedilir; sonraki çalıştırmalarda diskten okunur.
@@ -338,13 +358,37 @@ def run_torch_and_sync(model, optimizer, step_fn, *args, **kwargs):
     return model, optimizer
 
 
+def reset_torch_optimizer_state(optimizer):
+    """Optimizer'ı pristine duruma getirir — ama optimizer NESNESİNİ DEĞİŞTİRMEZ.
+
+    `torch.compile` guard'ları optimizer'ın object identity'sine (`check_obj_id`)
+    bakar; her tekrarda YENİ bir optimizer oluşturmak guard'ı düşürür ve yeniden
+    derleme tetikler. Momentumsuz SGD zaten DURUMSUZDUR (per-parametre state
+    tutmaz); yine de "pristine" garantisi için gradyanlar ve (varsa) per-parametre
+    state AYNI nesneler üzerinde temizlenir."""
+    optimizer.zero_grad(set_to_none=True)
+    if optimizer.state:
+        optimizer.state.clear()  # AYNI dict nesnesi korunur (yeniden atama YOK)
+
+
 def prepare_torch(device, init_host, compiled=False, seed=0):
-    """Modeli HOST init ağırlıklarından cihaza BİR KEZ taşır ve BAĞIMSIZ bir
-    "pristine" `state_dict` kopyası çıkarır. Döndürülen `reset_fn`, her
-    çağrıldığında modeli bu pristine duruma GERİ YÜKLER — `load_state_dict`
-    VAR OLAN parametre tensörlerine `.copy_()` yapar (yeni nesne OLUŞTURMAZ),
-    bu yüzden `torch.compile` önbelleği BOZULMAZ. Momentumsuz SGD'nin kendisi
-    DURUMSUZDUR, bu yüzden optimizer'ı yeniden kurmaya gerek yoktur."""
+    """Modeli/optimizer'ı/derlenmiş step'i BİR KEZ kurar ve iki ayrı reset yolu döndürür.
+
+    Bu fonksiyon her cihaz için YALNIZCA BİR KEZ çağrılır; döndürülen `model`,
+    `optimizer` ve `step_fn` (derlenmiş sarmalayıcı) TÜM ölçüm tekrarları boyunca
+    YENİDEN KULLANILIR — aksi halde `torch.compile` guard'ları her tekrarda düşer
+    ve `recompile_limit` aşılır (bkz. dosya başındaki not).
+
+    Dönüş:
+      reset_fn()           -> compute-only reset: cihazda tutulan BAĞIMSIZ pristine
+                              kopyadan geri yükler, HOST transferi YOKTUR.
+      step_fn              -> training step (compiled ise `torch.compile` sarmalayıcısı).
+      load_from_host_fn()  -> end-to-end reset: pristine ağırlıkları HOST'tan mevcut
+                              cihaz modeline yükler (GERÇEK host->device transferi).
+
+    Her iki reset de `load_state_dict` kullanır; bu VAR OLAN parametre tensörlerine
+    `.copy_()` yapar (yeni nesne OLUŞTURMAZ), bu yüzden derleme önbelleği BOZULMAZ.
+    Momentumsuz SGD durumsuz olduğundan optimizer'ı yeniden kurmaya gerek yoktur."""
     torch.manual_seed(seed)
     model = TorchMLP().to(device)
     load_init_into_torch(model, init_host)  # NumPy init ile BİREBİR AYNI başlangıç
@@ -353,13 +397,29 @@ def prepare_torch(device, init_host, compiled=False, seed=0):
     step_fn = torch.compile(train_step_torch) if compiled else train_step_torch
 
     pristine_state = {k: v.clone().detach() for k, v in model.state_dict().items()}  # cihazda, BAĞIMSIZ kopya
+    host_pristine_state = {k: v.detach().to("cpu").clone() for k, v in model.state_dict().items()}  # HOST'ta, BAĞIMSIZ kopya
 
     def reset_fn():
         with torch.no_grad():
             model.load_state_dict(pristine_state)  # cihaz-içi reset, host transferi YOK
+        reset_torch_optimizer_state(optimizer)
         return model, optimizer
 
-    return reset_fn, step_fn
+    def load_from_host_fn():
+        with torch.no_grad():
+            model.load_state_dict(host_pristine_state)  # HOST -> cihaz kopyası (round-trip'in parçası)
+        reset_torch_optimizer_state(optimizer)
+        return model, optimizer
+
+    return reset_fn, step_fn, load_from_host_fn
+
+
+def print_tf32_note():
+    """TF32 uyarısı bir performans önerisidir; adil kıyas için AYAR DEĞİŞTİRMİYORUZ."""
+    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:
+        print("  Not: GPU TF32 tensor core'larını destekliyor, ancak NumPy/JAX ile adil kıyas")
+        print("       için PyTorch'un varsayılan float32 matmul precision'ı KORUNUYOR")
+        print("       (`torch.set_float32_matmul_precision` çağrılmıyor).")
 
 
 def get_available_torch_devices() -> dict:
@@ -400,7 +460,9 @@ def benchmark_torch_implementation(label, compiled, devices_torch, init_host, x_
         y_test_labels_dev = torch.from_numpy(y_test_labels.astype(np.int64)).to(device)
         idx_dev = torch.from_numpy(idx_array.astype(np.int64)).to(device)
 
-        reset_fn, step_fn = prepare_torch(device, init_host, compiled=compiled)
+        # Model / optimizer / derlenmiş step BİR KEZ kurulur ve tüm ölçüm
+        # tekrarlarında (compute-only VE end-to-end) YENİDEN KULLANILIR.
+        reset_fn, step_fn, load_from_host_fn = prepare_torch(device, init_host, compiled=compiled)
 
         # --- Sanity check (TEK sefer, ölçüm dışı) ---
         sanity_model, _ = reset_fn()
@@ -425,8 +487,13 @@ def benchmark_torch_implementation(label, compiled, devices_torch, init_host, x_
 
         first_run_time = first_run_times[0]
         display_acc = accuracy_torch(first_model, x_test_dev, y_test_labels_dev).item()
-        tag = "derleme (torch.compile) dahil" if compiled else "graph warmup dahil"
-        print(f"  {'PyTorch first training run (' + tag + ')':<56}: {first_run_time:5.2f} s  (test_acc={display_acc*100:.2f}%)")
+        # Eager modda derleme/JIT YOKTUR; bu yüzden etiket de "derleme dahil" demez.
+        run_label = (
+            "PyTorch compiled first training run (torch.compile dahil)"
+            if compiled
+            else "PyTorch eager first training run"
+        )
+        print(f"  {run_label:<56}: {first_run_time:5.2f} s  (test_acc={display_acc*100:.2f}%)")
 
         # (b) Sıfırla + UNTIMED "gösterim" koşusu (ölçüme dahil DEĞİL).
         demo_model, demo_optimizer = reset_fn()
@@ -461,16 +528,22 @@ def benchmark_torch_implementation(label, compiled, devices_torch, init_host, x_
         # --- End-to-end (round-trip): her tekrarda HOST verisinden/ağırlık-
         # larından başlanır -> GPU'ya taşınır -> 5 epoch GPU'da eğitilir ->
         # son doğruluk host'a geri getirilir. ---
+        # NOT: burada `prepare_torch` YENİDEN ÇAĞRILMAZ. Yeni bir model/optimizer/
+        # derlenmiş sarmalayıcı oluşturmak `torch.compile` guard'larını (özellikle
+        # `check_obj_id(optimizer, ...)`) düşürür, her tekrarda yeniden derlemeye ve
+        # `recompile_limit` aşımına yol açardı. Round-trip semantiği korunur: veri
+        # host'tan cihaza kopyalanır ve pristine ağırlıklar HOST'tan yüklenir.
         def round_trip():
-            reset_fn_iter, step_fn_iter = prepare_torch(device, init_host, compiled=compiled)  # host -> GPU transferi BURADA
             x_train_iter = torch.from_numpy(x_train).to(device)
             y_train_labels_iter = torch.from_numpy(y_train_labels.astype(np.int64)).to(device)
             x_test_iter = torch.from_numpy(x_test).to(device)
             y_test_labels_iter = torch.from_numpy(y_test_labels.astype(np.int64)).to(device)
             idx_iter = torch.from_numpy(idx_array.astype(np.int64)).to(device)
 
+            model_iter, optimizer_iter = load_from_host_fn()  # HOST -> GPU ağırlık transferi BURADA
+
             final_model_iter, _ = run_torch_epochs(
-                *reset_fn_iter(), step_fn_iter, x_train_iter, y_train_labels_iter, x_test_iter, y_test_labels_iter, idx_iter,
+                model_iter, optimizer_iter, step_fn, x_train_iter, y_train_labels_iter, x_test_iter, y_test_labels_iter, idx_iter,
             )
             acc_iter = accuracy_torch(final_model_iter, x_test_iter, y_test_labels_iter)
             torch_sync(device)
@@ -569,10 +642,13 @@ def prepare_nnx(device, init_host, seed=0):
         model = MLP(rngs=nnx.Rngs(seed))
         # NNX'in kendi (rastgele) ilklendirmesini, NumPy tarafıyla BİREBİR AYNI
         # olan `init_host` ağırlıklarıyla EZİYORUZ (adil/eşit başlangıç):
-        model.fc1.kernel.value = jnp.asarray(init_host["W1"])
-        model.fc1.bias.value = jnp.asarray(init_host["b1"])
-        model.fc2.kernel.value = jnp.asarray(init_host["W2"])
-        model.fc2.bias.value = jnp.asarray(init_host["b2"])
+        # Güncel Flax NNX API'sinde `Variable.value` getter/setter'ı DEPRECATED;
+        # array Variable'lar için `variable[...]` ile okunur, `variable[...] = x`
+        # ile yazılır.
+        model.fc1.kernel[...] = jnp.asarray(init_host["W1"])
+        model.fc1.bias[...] = jnp.asarray(init_host["b1"])
+        model.fc2.kernel[...] = jnp.asarray(init_host["W2"])
+        model.fc2.bias[...] = jnp.asarray(init_host["b2"])
         optimizer = nnx.Optimizer(model, optax.sgd(LEARNING_RATE), wrt=nnx.Param)
 
     # nnx.state(...) TEK BAŞINA yeterli DEĞİL: geri dönen State, altta yatan
@@ -613,10 +689,10 @@ def benchmark_flax_implementation(devices, init_host, x_train, y_train_labels, x
 
         # --- Sanity check (TEK sefer, ölçüm dışı) ---
         sanity_model, _ = reset_fn()
-        assert np.allclose(np.asarray(sanity_model.fc1.kernel.value), init_host["W1"]), f"[Flax/{name}] pristine W1 NumPy init ile eşleşmiyor!"
-        assert np.allclose(np.asarray(sanity_model.fc1.bias.value), init_host["b1"]), f"[Flax/{name}] pristine b1 NumPy init ile eşleşmiyor!"
-        assert np.allclose(np.asarray(sanity_model.fc2.kernel.value), init_host["W2"]), f"[Flax/{name}] pristine W2 NumPy init ile eşleşmiyor!"
-        assert np.allclose(np.asarray(sanity_model.fc2.bias.value), init_host["b2"]), f"[Flax/{name}] pristine b2 NumPy init ile eşleşmiyor!"
+        assert np.allclose(np.asarray(sanity_model.fc1.kernel[...]), init_host["W1"]), f"[Flax/{name}] pristine W1 NumPy init ile eşleşmiyor!"
+        assert np.allclose(np.asarray(sanity_model.fc1.bias[...]), init_host["b1"]), f"[Flax/{name}] pristine b1 NumPy init ile eşleşmiyor!"
+        assert np.allclose(np.asarray(sanity_model.fc2.kernel[...]), init_host["W2"]), f"[Flax/{name}] pristine W2 NumPy init ile eşleşmiyor!"
+        assert np.allclose(np.asarray(sanity_model.fc2.bias[...]), init_host["b2"]), f"[Flax/{name}] pristine b2 NumPy init ile eşleşmiyor!"
         print(f"  [{name}] Sanity check: reset sonrası ağırlıklar NumPy init ile eşleşiyor. ✓")
 
         # (a) "first training run": PRISTINE durumdan, verbose=False, HENÜZ
@@ -758,6 +834,7 @@ if __name__ == "__main__":
     torch_devices = get_available_torch_devices()
     print(f"  Bulunan JAX cihazları    : {list(devices.keys())}")
     print(f"  Bulunan PyTorch cihazları: {list(torch_devices.keys())}")
+    print_tf32_note()
 
     (x_train_full, y_train_full), (x_test_full, y_test_full) = load_mnist()
 
