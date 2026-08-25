@@ -13,9 +13,19 @@ Pytree nedir?
   kalmadan doğal bir sözlük (dict) yapısıyla çalışabiliriz.
 
 Model: x -> Linear(W1, b1) -> tanh -> Linear(W2, b2) -> y_pred
+
+GPU'da iki ayrı süre raporlanır (compute-only vs end-to-end); nedeni ve
+kapsamı için Deney 2'deki (02_kernel_fusion.py) açıklamaya bakınız. Burada
+girdi/ağırlıklar küçük olduğundan transfer maliyeti ihmal edilebilir
+düzeydedir; yine de metodoloji tutarlılığı için aynı ayrım uygulanır.
+
+Tek eğitim adımı `timeit` ile 10 kez ölçülür; ortalama ve standart sapma
+raporlanır. JIT derleme süresi bir warmup çağrısıyla ölçüm dışı bırakılır ve
+her ölçüm çağrısı `.block_until_ready()` ile senkronize edilir.
 """
 
-import time
+import statistics
+import timeit
 
 import numpy as np
 
@@ -28,6 +38,7 @@ HIDDEN_DIM = 8
 OUT_DIM = 1
 N_SAMPLES = 256
 LEARNING_RATE = 0.1
+REPEATS = 10
 
 
 # ---------------------------------------------------------------------------
@@ -92,31 +103,23 @@ def get_available_devices() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Belirli bir cihazda tek eğitim adımını çalıştırır (warmup + ölçüm).
-# ÖNEMLİ: params/X/Y bir kez, döngüden ÖNCE oluşturulduğu için belirli bir
-# cihaza "commit" edilmiştir. `jax.device_put` bir Pytree'yi (params gibi
-# iç içe dict) TEK ÇAĞRIDA hedef cihaza kopyalar; bu yüzden her cihaz için
-# veriyi açıkça o cihaza taşıyoruz.
+# fn'i timeit ile `repeat` kez ölçer; (süreler [s], son çağrının sonucu) döndürür.
 # ---------------------------------------------------------------------------
-def run_on_device(device, params, X, Y):
-    params_dev = jax.device_put(params, device)
-    X_dev = jax.device_put(X, device)
-    Y_dev = jax.device_put(Y, device)
+def time_it(fn, repeat: int = REPEATS):
+    result = None
 
-    warm_params, warm_loss = train_step(params_dev, X_dev, Y_dev)  # warmup
-    jax.block_until_ready((warm_params, warm_loss))
+    def call():
+        nonlocal result
+        result = fn()
 
-    t0 = time.perf_counter()
-    new_params, _ = train_step(params_dev, X_dev, Y_dev)
-    jax.block_until_ready(new_params)
-    step_time = time.perf_counter() - t0
+    times = timeit.repeat(call, number=1, repeat=repeat)
+    return times, result
 
-    # loss_after_step (train_step'in döndürdüğü), GÜNCELLEMEDEN ÖNCEKİ (eski)
-    # ağırlıklarla hesaplanır (jax.value_and_grad böyle çalışır); güncelleme
-    # sonrası gerçek kaybı görmek için yeni ağırlıklarla tekrar hesaplıyoruz.
-    loss_after_update = float(loss_fn(new_params, X_dev, Y_dev))
 
-    return step_time, loss_after_update
+def print_stats(label: str, times: list) -> None:
+    mean_ms = statistics.mean(times) * 1000
+    std_ms = statistics.stdev(times) * 1000
+    print(f"  {label:<28}: {mean_ms:6.3f} ± {std_ms:5.3f} ms (n={len(times)})")
 
 
 if __name__ == "__main__":
@@ -145,12 +148,71 @@ if __name__ == "__main__":
     initial_loss = float(loss_fn(params, X, Y))
     print(f"\nBaşlangıç kaybı (loss): {initial_loss:.6f}")
 
-    # --- Her bulunan cihazda (CPU, varsa GPU) tek eğitim adımını çalıştır ---
-    for name, device in devices.items():
-        step_time, loss_after_update = run_on_device(device, params, X, Y)
+    # End-to-end ölçümü için host (NumPy) kopyaları: `jax.device_put` bir
+    # Pytree'yi (params gibi iç içe dict) TEK ÇAĞRIDA hedef cihaza kopyalar.
+    params_host = jax.tree_util.tree_map(np.asarray, params)
+    X_host = np.asarray(X)
+    Y_host = np.asarray(Y)
 
+    for name, device in devices.items():
         print(f"\n  --- {name} ---")
+
+        if name != "GPU":
+            # Tek cihaz ölçümü (CPU): veri bir kez cihaza taşınır, sonrasında
+            # SADECE derlenmiş fonksiyonun çalışma süresi ölçülür.
+            params_dev = jax.device_put(params, device)
+            X_dev = jax.device_put(X, device)
+            Y_dev = jax.device_put(Y, device)
+
+            # İlk çağrı: JIT derlemesi + ilk çalıştırmayı birlikte içerir. Bu
+            # çağrı warmup görevini de görür, ama artık atılmıyor — süresi
+            # ayrıca raporlanıyor (bkz. Deney 2'deki aynı ayrım).
+            first_call_time = timeit.timeit(
+                lambda: jax.block_until_ready(train_step(params_dev, X_dev, Y_dev)), number=1
+            )
+            print(f"  {'JAX first call (compile+run)':<28}: {first_call_time*1000:6.3f} ms")
+
+            cpu_times, (new_params, _) = time_it(
+                lambda: jax.block_until_ready(train_step(params_dev, X_dev, Y_dev))
+            )
+            loss_after_update = float(loss_fn(new_params, X_dev, Y_dev))
+
+            print(f"  1 adım sonrası kayıp (loss)    : {loss_after_update:.6f}")
+            print_stats(f"Tek eğitim adımı steady-state [{name}]", cpu_times)
+            continue
+
+        # =====================================================================
+        # GPU: iki ayrı, birbirine KARIŞTIRILMAMASI gereken ölçüm.
+        # =====================================================================
+
+        # --- Compute-only: veri ÖNCEDEN GPU'ya taşınmış, warmup yapılmış.
+        # Host<->GPU transferi ölçüme dahil DEĞİL. ---
+        params_gpu = jax.device_put(params, device)
+        X_gpu = jax.device_put(X, device)
+        Y_gpu = jax.device_put(Y, device)
+
+        jax.block_until_ready(train_step(params_gpu, X_gpu, Y_gpu))  # warmup (JIT derlemesi)
+
+        gpu_compute_times, (new_params, _) = time_it(
+            lambda: jax.block_until_ready(train_step(params_gpu, X_gpu, Y_gpu))
+        )
+        loss_after_update = float(loss_fn(new_params, X_gpu, Y_gpu))
+
         print(f"  1 adım sonrası kayıp (loss)    : {loss_after_update:.6f}")
-        print(f"  Tek eğitim adımı süresi [{name}] : {step_time*1000:.3f} ms  (jit sonrası)")
+        print_stats("GPU compute-only", gpu_compute_times)
+
+        # --- End-to-end (round-trip): host -> GPU -> hesapla -> host.
+        # jax.device_get() hem hesaplamanın bitmesini bekler hem sonucu gerçekten
+        # host belleğine kopyalar. Fonksiyon zaten derlenmiş; JIT bu ölçüme girmez. ---
+        def round_trip():
+            params_gpu_iter = jax.device_put(params_host, device)
+            X_gpu_iter = jax.device_put(X_host, device)
+            Y_gpu_iter = jax.device_put(Y_host, device)
+            new_params_iter, loss_iter = train_step(params_gpu_iter, X_gpu_iter, Y_gpu_iter)
+            return jax.device_get((new_params_iter, loss_iter))
+
+        round_trip()  # warmup: allocator/transfer yollarını ısıt (JIT zaten hazır)
+        gpu_e2e_times, _ = time_it(round_trip)
+        print_stats("GPU end-to-end", gpu_e2e_times)
 
     print("=" * 62)

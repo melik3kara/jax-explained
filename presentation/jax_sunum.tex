@@ -1,0 +1,419 @@
+% !TeX program = pdflatex
+% JAX Sunumu - sade Beamer şablonu (Overleaf uyumlu)
+\documentclass[aspectratio=169]{beamer}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[turkish]{babel}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{positioning}
+
+% --- Sade tema ---
+\usetheme{Boadilla}
+\usecolortheme{default}
+\setbeamertemplate{navigation symbols}{}
+\setbeamertemplate{footline}[frame number]
+\setbeamercolor{block title}{bg=blue!15,fg=black}
+\setbeamercolor{block body}{bg=blue!5,fg=black}
+
+% --- Kod stili ---
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue!70!black}\bfseries,
+  commentstyle=\color{gray},
+  stringstyle=\color{green!40!black},
+  breaklines=true,
+  showstringspaces=false,
+  frame=single,
+  language=Python
+}
+
+\title{JAX'e Giriş}
+\subtitle{Hız, Otomatik Türev ve Paralellik}
+\author{Ad Soyad}
+\date{\today}
+
+\begin{document}
+
+% ---------------------------------------------------------
+\begin{frame}
+  \titlepage
+\end{frame}
+
+% ---------------------------------------------------------
+\begin{frame}{İçindekiler}
+  \tableofcontents
+\end{frame}
+
+% ===========================================================
+\section{JAX Nedir?}
+% ===========================================================
+
+\begin{frame}{JAX Nedir?}
+  \begin{itemize}
+    \item JAX, Google tarafından geliştirilen bir \textbf{sayısal hesaplama kütüphanesi}dir.
+    \item NumPy ile aynı sözdizimini kullanır (\texttt{jax.numpy}), ama üç önemli ek özellik sunar:
+    \begin{itemize}
+      \item \textbf{Otomatik türev} (\texttt{grad})
+      \item \textbf{JIT derleme} (\texttt{jit}) ile donanıma özel hızlı kod üretimi
+      \item \textbf{Otomatik vektörleştirme ve paralelleştirme} (\texttt{vmap}, \texttt{pmap})
+    \end{itemize}
+    \item Arka planda çalışan derleyici: \textbf{XLA} (Accelerated Linear Algebra).
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Neden JAX?}
+  \begin{itemize}
+    \item NumPy kodu genelde satır satır (eager) çalışır; her işlem belleğe gidip gelir.
+    \item JAX ise kodu önce bir \textbf{işlem grafiğine} çevirir, sonra derler.
+    \item Sonuç: aynı matematiği yazarsınız, ama çok daha hızlı ve ölçeklenebilir çalışır.
+    \item Araştırma ve üretimde tercih sebepleri:
+    \begin{itemize}
+      \item Kesin (analitik) gradyanlar
+      \item GPU/TPU'da otomatik hızlanma
+      \item Basit kod ile toplu (batch) işlem
+    \end{itemize}
+  \end{itemize}
+\end{frame}
+
+% ===========================================================
+\section{XLA ve Derleme}
+% ===========================================================
+
+\begin{frame}{XLA Nedir?}
+  \begin{itemize}
+    \item XLA (Accelerated Linear Algebra), doğrusal cebir işlemlerini hızlandırmak için tasarlanmış bir \textbf{makine öğrenimi derleyicisi}dir.
+    \item JAX, TensorFlow ve PyTorch/XLA'nın arkasındaki ortak motordur.
+    \item \texttt{@jax.jit} yazdığınızda:
+    \begin{enumerate}
+      \item JAX kodu bir işlem grafiğine (\textbf{Jaxpr}) çevirir.
+      \item Jaxpr, XLA derleyicisine teslim edilir.
+      \item XLA, grafiği optimize edip donanıma özel makine koduna dönüştürür.
+    \end{enumerate}
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Bellek Duvarı (Memory Wall)}
+  \textbf{Problem:} Modern donanımda asıl darboğaz işlem hızı değil, veriyi bellekten sürekli okuyup yazmaktır.
+
+  \vspace{0.4cm}
+  \begin{center}
+  \begin{tikzpicture}[thick]
+    \node[draw, rectangle, minimum width=3.4cm, minimum height=1.4cm, fill=blue!10, align=center, font=\small]
+      (mem) {VRAM / HBM\\(Bellek)};
+    \node[draw, rectangle, minimum width=3.4cm, minimum height=1.4cm, fill=green!10, align=center, font=\small,
+      right=4.6cm of mem] (alu) {ALU / Tensor Core\\(Çok Hızlı)};
+    \draw[->, line width=0.8pt] ([yshift=3mm]mem.east) -- node[above, font=\scriptsize]{oku} ([yshift=3mm]alu.west);
+    \draw[<-, line width=0.8pt] ([yshift=-3mm]mem.east) -- node[below, font=\scriptsize]{yaz} ([yshift=-3mm]alu.west);
+    \node[below=0.15cm of mem, text width=3.6cm, align=center, font=\scriptsize] {Yüksek kapasite,\\ama sınırlı bant genişliği};
+    \node[below=0.15cm of alu, text width=3.6cm, align=center, font=\scriptsize] {Çok hızlı hesaplar,\\veri bekler};
+  \end{tikzpicture}
+  \end{center}
+
+  \vspace{0.2cm}
+  \centering \textbf{Dar bant $\Rightarrow$ darboğaz (bottleneck)}: çip veriyi işlemekten çok, veri gelmesini bekler.
+\end{frame}
+
+\begin{frame}{XLA: Kernel Fusion (Çekirdek Birleştirme)}
+  \textbf{NumPy (füzyonsuz):} her adımda ayrı bellek okuma/yazma
+  \begin{itemize}
+    \item $T_1 = \sin(A)$ \quad $\to$ belleğe yaz
+    \item $T_2 = \cos(B)$ \quad $\to$ belleğe yaz
+    \item $T_3 = T_1 \cdot T_2 + \exp(A)$ \quad $\to$ belleğe yaz
+  \end{itemize}
+
+  \vspace{0.3cm}
+  \textbf{XLA (füzyonlu):} veriyi bir kez okur, tüm işlemi yazmaçlarda (register) yapar, sonucu bir kez yazar $\Rightarrow$ bant genişliği baskısı azalır.
+\end{frame}
+
+% ===========================================================
+\section{Değişmezlik ve Saf Fonksiyonlar}
+% ===========================================================
+
+\begin{frame}[fragile]{Diziler Neden Değiştirilemez (Immutable)?}
+  JAX dizileri yerinde değiştirilemez: \texttt{x[0] = 5} \textbf{çalışmaz}. Bunun yerine:
+  \begin{lstlisting}
+x_yeni = x.at[0].set(5)
+  \end{lstlisting}
+  \textbf{Üç teknik neden:}
+  \begin{enumerate}
+    \item \textbf{Otomatik türev:} Geri geçişte eski değerlere ihtiyaç vardır; veri ezilirse gradyan yanlış hesaplanır.
+    \item \textbf{Tracing / grafik çıkarımı:} Gizli mutasyon, derleyicinin veri akışını takip etmesini engeller.
+    \item \textbf{Paralel çalışma:} Değiştirilemez veri, kilit (lock) gerekmeden güvenle paylaşılabilir.
+  \end{enumerate}
+\end{frame}
+
+\begin{frame}{Saf Fonksiyonlar (Pure Functions)}
+  JAX yalnızca \textbf{saf fonksiyonlar} üzerinde güvenle çalışır:
+  \begin{itemize}
+    \item Tüm girdiler parametre olarak verilmeli, tüm çıktılar return ile dönmeli.
+    \item Aynı girdi $\to$ her zaman aynı çıktı.
+    \item Global değişken güncelleme, dosyaya yazma gibi \textbf{yan etkiler} JIT içinde güvenilmezdir.
+    \item Standart \texttt{print(x)} yalnızca derleme (trace) anında çalışır; çalışma zamanı değerini görmek için \texttt{jax.debug.print} kullanılır.
+  \end{itemize}
+\end{frame}
+
+% ===========================================================
+\section{jax.Array ve Sharding}
+% ===========================================================
+
+\begin{frame}[fragile]{jax.Array: Veri Nerede Yaşar?}
+  \begin{itemize}
+    \item \texttt{jnp.zeros((10, 10))} yazdığınızda dizi otomatik olarak en güçlü donanımda (GPU/TPU varsa orada, yoksa CPU'da) oluşturulur.
+    \item PyTorch'taki gibi elle \texttt{.to('cuda')} yazmaya gerek yoktur.
+  \end{itemize}
+  \begin{lstlisting}
+x = jnp.arange(5)
+print(x.devices())   # {CudaDevice(id=0)} veya {CpuDevice(id=0)}
+print(x.sharding)    # SingleDeviceSharding(...)
+  \end{lstlisting}
+\end{frame}
+
+\begin{frame}{Sharding (Parçalama) Nedir?}
+  \begin{itemize}
+    \item Büyük tensörler tek bir GPU'nun belleğine sığmayabilir.
+    \item \textbf{Sharding}, tek bir mantıksal dizinin birden fazla cihaza dağıtılmasıdır.
+    \item Üç temel tür:
+    \begin{itemize}
+      \item \textbf{Replicated:} her cihazda tam kopya
+      \item \textbf{Sharded:} eksenler boyunca bölünmüş
+      \item \textbf{Partial/Hibrit:} kısmi dağıtım (tensor parallelism)
+    \end{itemize}
+    \item Kullanıcı hâlâ tek bir \texttt{x} tensörüyle çalışır; XLA gerekli cihazlar arası iletişimi (all-reduce vb.) otomatik olarak ekler (SPMD).
+  \end{itemize}
+\end{frame}
+
+% ===========================================================
+\section{vmap: Otomatik Vektörleştirme}
+% ===========================================================
+
+\begin{frame}{vmap Nedir?}
+  \begin{itemize}
+    \item \texttt{vmap}, tek bir örnek için yazılmış fonksiyonu, fonksiyona dokunmadan \textbf{toplu veri (batch)} işleyebilir hale getirir.
+    \item Python döngüsü kullanmaz; işlemleri derleme aşamasında vektörize eder.
+    \item Avantaj: kod sade kalır, boyut/eksen hatası riski azalır, hız artar.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}[fragile]{vmap Örneği: İki Nokta Arası Mesafe}
+  \begin{lstlisting}
+def mesafe(p1, p2):
+    return jnp.sqrt(jnp.sum((p1 - p2) ** 2))
+
+# Tek fonksiyona dokunmadan 50.000 nokta çiftine uygula:
+batch_mesafe = jax.vmap(mesafe)
+sonuclar = batch_mesafe(noktalar_A, noktalar_B)
+  \end{lstlisting}
+  \begin{itemize}
+    \item CNN/Encoder-Decoder'da: modeli tek resim için yazıp \texttt{vmap} ile batch boyutunu otomatik yönetmek yaygın bir kullanımdır.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}[fragile]{vmap ile CNN / Encoder-Decoder}
+  \textbf{Fikir:} Encoder ve Decoder'ı tek bir resim için yazın; batch boyutunu (\texttt{B}) hiç düşünmeyin.
+  \begin{lstlisting}
+def encode_single(params, image):      # (H, W, C) -> (latent,)
+    x = jnp.dot(image, params['w1'])
+    return jax.nn.relu(x)
+
+def decode_single(params, latent):     # (latent,) -> (H, W, C)
+    return jnp.dot(latent, params['w2'])
+
+# in_axes=(None, 0): params sabit, batch ekseni 0
+batch_encode = jax.vmap(encode_single, in_axes=(None, 0))
+batch_decode = jax.vmap(decode_single, in_axes=(None, 0))
+
+latents = batch_encode(params, batch_images)  # (32, 64, 64, 3) -> (32, latent)
+recons  = batch_decode(params, latents)       # (32, latent) -> (32, 64, 64, 3)
+  \end{lstlisting}
+  \begin{itemize}
+    \item Avantaj: \texttt{reshape}/\texttt{unsqueeze} gibi boyut oynamaları yok, kod tek örnek mantığına odaklanır.
+    \item Aynı yaklaşım: patch-tabanlı işleme (ViT), model \textbf{ensemble} tahmini, veri artırma (augmentation).
+  \end{itemize}
+\end{frame}
+
+% ===========================================================
+\section{Deneyler}
+% ===========================================================
+
+\begin{frame}{Deney Planı}
+  \begin{table}
+    \small
+    \begin{tabular}{@{}cll@{}}
+      \toprule
+      \# & Deney & Odaklanılan Kavram \\
+      \midrule
+      1 & Döngü Benchmark'ı & \texttt{for} vs \texttt{fori\_loop}/\texttt{scan} \\
+      2 & Elementwise \& Fusion & NumPy vs JAX JIT \\
+      3 & Otomatik Batching & \texttt{vmap} ile 50k nokta \\
+      4 & Autodiff \& Hessian & Sonlu farklar vs \texttt{grad} \\
+      5 & Mini Model & Pytree ile eğitim adımı \\
+      6 & MNIST & NumPy vs JAX karşılaştırması \\
+      7 & Kontrol Akışı & \texttt{cond}, \texttt{switch}, \texttt{while\_loop} \\
+      \bottomrule
+    \end{tabular}
+  \end{table}
+\end{frame}
+
+\begin{frame}{Deney 1: Döngü Karşılaştırması (1.000.000 adım)}
+  \begin{table}
+    \small
+    \begin{tabular}{@{}lr@{}}
+      \toprule
+      Yöntem & Süre \\
+      \midrule
+      Python \texttt{for} döngüsü & 89.79 ms \\
+      \texttt{jax.lax.fori\_loop} & 5.63 ms \\
+      \texttt{jax.lax.scan} & 7.51 ms \\
+      \bottomrule
+    \end{tabular}
+  \end{table}
+  \begin{itemize}
+    \item \texttt{fori\_loop}: \textbf{16x}, \texttt{scan}: \textbf{12x} daha hızlı (Python'a göre).
+    \item Neden: döngü tamamen XLA seviyesinde derleniyor, CPython devre dışı kalıyor.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Deney 2: Kernel Fusion Kıyaslaması (10M eleman)}
+  \begin{table}
+    \small
+    \begin{tabular}{@{}lr@{}}
+      \toprule
+      Yöntem & Süre \\
+      \midrule
+      NumPy (füzyonsuz) & 222.82 ms \\
+      JAX \texttt{@jax.jit} (füzyonlu) & 24.77 ms \\
+      \bottomrule
+    \end{tabular}
+  \end{table}
+  \begin{itemize}
+    \item Hızlanma: \textbf{9x}. Sayısal fark: $4.24 \times 10^{-7}$ (ihmal edilebilir).
+    \item İşlem: $y = \sin(A)\cdot\cos(B) + \exp(A)$
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Deney 3: vmap ile Vektörleştirme (50.000 nokta)}
+  \begin{table}
+    \small
+    \begin{tabular}{@{}lr@{}}
+      \toprule
+      Yöntem & Süre \\
+      \midrule
+      Python \texttt{for} döngüsü & 15.97 ms \\
+      NumPy (eksen manipülasyonu) & 1.03 ms \\
+      \texttt{jax.vmap} & 0.13 ms \\
+      \bottomrule
+    \end{tabular}
+  \end{table}
+  \begin{itemize}
+    \item \texttt{vmap}: Python döngüsüne göre \textbf{118.7x} daha hızlı.
+    \item Kod hiç değişmeden (reshape / axis manipülasyonu olmadan) elde edildi.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Deney 4: Autodiff vs Sonlu Farklar}
+  \begin{itemize}
+    \item Gradyan sonucu (her iki yöntem de aynı): $[-5.356,\ 2.740,\ -1.653]$
+    \item \texttt{jax.grad} ile fark: $3.69 \times 10^{-11}$ (analitik hassasiyet).
+    \item \texttt{jacfwd(jacrev(f))} ile tam Hessian matrisi tek seferde hesaplandı.
+  \end{itemize}
+  \begin{table}
+    \small
+    \begin{tabular}{@{}lr@{}}
+      \toprule
+      Yöntem & Süre \\
+      \midrule
+      NumPy Sonlu Farklar & 0.15 ms \\
+      JAX Autodiff & 0.04 ms \\
+      \bottomrule
+    \end{tabular}
+  \end{table}
+  Hızlanma: \textbf{3.8x} — ayrıca sonlu farklar yaklaşık, \texttt{grad} kesin sonuç verir.
+\end{frame}
+
+\begin{frame}{Deney 5: Pytree ile Saf Fonksiyonel Eğitim}
+  \begin{itemize}
+    \item Model ağırlıkları iç içe sözlük (Pytree) olarak tutuldu: \texttt{W1, b1, W2, b2}
+    \item Tek çağrı: \texttt{grad(loss\_fn)(params, data)} $\to$ tüm parametrelerin gradyanı
+    \item Güncelleme: \texttt{jax.tree.map} ile parametre-gradyan eşleştirilerek uygulandı.
+  \end{itemize}
+  \begin{itemize}
+    \item Başlangıç kaybı: 5.162486
+    \item 1 adım sonrası kayıp: 4.961453
+    \item Adım süresi (JIT sonrası): 0.048 ms
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Deney 6: MNIST Sınıflandırma}
+  Mimari: 784 $\to$ 128 (tanh) $\to$ 10 (softmax), 5 epoch, batch 100
+  \begin{table}
+    \small
+    \begin{tabular}{@{}lrr@{}}
+      \toprule
+      Yöntem & Süre & Test Doğruluğu \\
+      \midrule
+      NumPy (elle backprop) & 0.88 s & 93.35\% \\
+      JAX (\texttt{grad} + \texttt{jit}) & 0.79 s & 93.35\% \\
+      \bottomrule
+    \end{tabular}
+  \end{table}
+  \begin{itemize}
+    \item Doğruluk aynı (elle türetilen backprop matematiksel olarak eşdeğer).
+    \item CPU'da bile JAX bir miktar daha hızlı; GPU/TPU'da fark büyür.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Deney 7: Kontrol Akışı Primitifleri}
+  \begin{itemize}
+    \item \texttt{lax.cond}: JIT içinde çalışan if/else. Standart Python \texttt{if} JIT altında \textbf{TracerBoolConversionError} verir.
+    \item \texttt{lax.switch}: çok yollu dallanma; indeks aralık dışıysa son dala kırpılır.
+    \item \texttt{lax.while\_loop}: dinamik adım sayılı döngü (ör. Newton–Raphson) çalışır, ama \textbf{reverse-mode türev desteklemez}.
+    \item \texttt{vmap + cond/switch}: tüm dallar batch üzerinde hesaplanır, sonuç sonra seçilir.
+  \end{itemize}
+\end{frame}
+
+% ===========================================================
+\section{Dikkat Edilmesi Gerekenler}
+% ===========================================================
+
+\begin{frame}{Dikkat Edilmesi Gerekenler (1/2)}
+  \begin{enumerate}
+    \item \textbf{Değişmezlik:} \texttt{x[0]=5} yasak; \texttt{x.at[0].set(5)} kullanılır.
+    \item \textbf{Saf fonksiyon zorunluluğu:} JIT içinde global değişken güncelleme, dosya yazma gibi yan etkilerden kaçının.
+    \item \textbf{Statik şekil kuralı:} Tensör boyutları derleme anında belli olmalı; içeriğe bağlı dinamik boyut (\texttt{x[x>0]}) JIT'te çalışmaz.
+    \item \textbf{Python \texttt{if} vs \texttt{lax.cond}:} Tensör değerine göre dallanma \texttt{lax.cond} gerektirir.
+  \end{enumerate}
+\end{frame}
+
+\begin{frame}{Dikkat Edilmesi Gerekenler (2/2)}
+  \begin{enumerate}
+    \setcounter{enumi}{4}
+    \item \textbf{Açık rastgelelik:} \texttt{numpy.random.seed()} gibi küresel durum yok; anahtar bölünmeli: \texttt{key, subkey = jax.random.split(key)}.
+    \item \textbf{Asenkron çalışma:} JAX işlemi GPU'ya fırlatıp hemen döner; doğru ölçüm için \texttt{.block\_until\_ready()} kullanılmalı.
+    \item \textbf{float32 varsayılanı:} Yüksek hassasiyet için \texttt{jax.config.update("jax\_enable\_x64", True)} açılmalı.
+  \end{enumerate}
+\end{frame}
+
+% ===========================================================
+\section{Özet}
+% ===========================================================
+
+\begin{frame}{Özet}
+  \begin{itemize}
+    \item JAX = NumPy sözdizimi + otomatik türev + JIT derleme (XLA) + otomatik vektörleştirme.
+    \item Değişmezlik ve saf fonksiyonlar, hız ve doğru türev alma için birer \textbf{zorunluluk}, sınırlama değil.
+    \item \texttt{vmap} kod sadeliği ile ciddi hız kazancını bir arada sunar.
+    \item Deneyler tutarlı biçimde gösterdi: Python döngüsü $<$ NumPy $<$ JAX (JIT/vmap/scan).
+    \item Kontrol akışında \texttt{lax.cond/switch/scan/while\_loop} JIT-uyumlu alternatiflerdir.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}
+  \centering
+  \Huge Teşekkürler
+\end{frame}
+
+\end{document}

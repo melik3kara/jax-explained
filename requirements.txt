@@ -1,2 +1,5 @@
 jax
 numpy
+flax
+optax
+torch

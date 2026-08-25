@@ -10,19 +10,41 @@ Deney 1: Döngü Karşılaştırması
                                        genelde fori_loop'tan bile hızlıdır
                                        çünkü XLA daha fazla optimizasyon fırsatı bulur.
 
+Her yöntem `timeit` ile 10 kez ölçülür; ortalama ve standart sapma raporlanır.
+JAX fonksiyonları için JIT derleme süresi bir warmup çağrısıyla ölçüm dışı bırakılır
+ve her ölçüm çağrısı `.block_until_ready()` ile senkronize edilir.
+
+Not (ilk çağrı / steady-state ayrımı — Deney 2'deki ile aynı mantık): Python
+için ölçümden önce 1 kez untimed warmup çalıştırılır (Python'da ölçülecek bir
+"derleme" maliyeti yoktur). JAX'ta ise `fori_loop`/`scan`'in ilk çağrısı hem
+JIT derlemesini hem de gerçek çalışmayı içerir; bu çağrı warmup olarak
+kullanılmaya devam eder, ama artık atılmıyor — süresi "first call (compile +
+run)" olarak ayrıca raporlanır. Sonrasındaki 10 tekrarlık "steady-state"
+ölçümü, derlenmiş fonksiyonun saf çalışma süresini yansıtır. Hızlanma
+(speedup) hesabı SADECE steady-state ortalamaları üzerinden yapılır. Ayrıca
+her JAX yöntemi için, ilk çağrının derleme maliyetinin kaç tekrarda "amorti"
+olduğunu (break-even) gösteren yaklaşık bir tekrar sayısı raporlanır.
+
+Not (compute-only / end-to-end ayrımı burada YOK): `N_STEPS` ve `DT` sabit,
+küçük skaler değerlerdir (N_STEPS zaten `static_argnums` ile derleme zamanı
+sabitidir); ölçülecek büyüklükte bir host dizisi cihaza taşınmaz. Bu yüzden
+buradaki tüm ölçümler doğası gereği "compute-only"dur; Deney 2, 3, 5 ve 6'da
+olduğu gibi ayrı bir "end-to-end" varyantı anlamlı değildir.
+
 Kural: state_{n+1} = state_n + sin(n * 0.001)
 """
 
 import math
-import time
+import statistics
+import timeit
 from functools import partial
 
 import jax
 import jax.numpy as jnp
 
-
 N_STEPS = 1_000_000
 DT = 0.001
+REPEATS = 10
 
 
 # ---------------------------------------------------------------------------
@@ -62,13 +84,6 @@ def jax_scan_loop(n_steps: int, dt: float) -> jnp.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Yardımcı: şık çıktı basma
-# ---------------------------------------------------------------------------
-def print_row(label: str, seconds: float, result: float) -> None:
-    print(f"  {label:<32} {seconds*1000:>10.2f} ms   sonuç = {result:.6f}")
-
-
-# ---------------------------------------------------------------------------
 # Yardımcı: bu makinede bulunan JAX cihazlarını (CPU / GPU) tespit et.
 # GPU yoksa jax.devices("gpu") hata fırlatır; bunu sessizce yakalayıp atlıyoruz.
 # ---------------------------------------------------------------------------
@@ -86,25 +101,35 @@ def get_available_devices() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Belirli bir cihazda fori_loop ve scan'i çalıştırıp (warmup + ölçüm) süreleri döndürür.
-# `jax.default_device` bloğu içinde oluşturulan/çalıştırılan her şey o cihazda çalışır.
+# fn'i timeit ile `repeat` kez ölçer; (süreler [s], son çağrının sonucu) döndürür.
 # ---------------------------------------------------------------------------
-def run_on_device(device) -> dict:
-    with jax.default_device(device):
-        _ = jax_fori_loop(N_STEPS, DT).block_until_ready()  # warmup
-        t0 = time.perf_counter()
-        fori_result = jax_fori_loop(N_STEPS, DT).block_until_ready()
-        fori_time = time.perf_counter() - t0
+def time_it(fn, repeat: int = REPEATS):
+    result = None
 
-        _ = jax_scan_loop(N_STEPS, DT).block_until_ready()  # warmup
-        t0 = time.perf_counter()
-        scan_result = jax_scan_loop(N_STEPS, DT).block_until_ready()
-        scan_time = time.perf_counter() - t0
+    def call():
+        nonlocal result
+        result = fn()
 
-    return {
-        "fori_time": fori_time, "fori_result": float(fori_result),
-        "scan_time": scan_time, "scan_result": float(scan_result),
-    }
+    times = timeit.repeat(call, number=1, repeat=repeat)
+    return times, result
+
+
+def print_stats(label: str, times: list, result: float) -> None:
+    mean_ms = statistics.mean(times) * 1000
+    std_ms = statistics.stdev(times) * 1000
+    print(f"  {label}: {mean_ms:.2f} ± {std_ms:.2f} ms (n={len(times)})   sonuç = {result:.6f}")
+
+
+# ---------------------------------------------------------------------------
+# Kaç tekrardan sonra JAX'in TOPLAM süresi (ilk çağrı + sonraki steady-state
+# çağrılar) Python baseline'ının toplam süresini geçer (amortisman noktası)?
+#   first_call + (n-1)*steady <= n*baseline  =>  n >= (first_call-steady)/(baseline-steady)
+# ---------------------------------------------------------------------------
+def break_even_repeats(first_call_time: float, steady_mean: float, baseline_mean: float):
+    if baseline_mean <= steady_mean:
+        return None  # steady-state Python'dan hızlı değil; hiçbir zaman amorti olmaz
+    n = (first_call_time - steady_mean) / (baseline_mean - steady_mean)
+    return max(1, math.ceil(n))
 
 
 if __name__ == "__main__":
@@ -115,25 +140,54 @@ if __name__ == "__main__":
     devices = get_available_devices()
     print(f"  Bulunan cihazlar: {list(devices.keys())}")
 
-    # --- Referans: Saf Python (cihazdan bağımsız, bir kez ölçülür) ---
-    t0 = time.perf_counter()
-    py_result = python_for_loop(N_STEPS, DT)
-    py_time = time.perf_counter() - t0
+    # --- Referans: Saf Python (cihazdan bağımsız) ---
+    python_for_loop(N_STEPS, DT)  # untimed warmup (Python'da derleme maliyeti yok)
 
-    print("\nSonuçlar (warmup sonrası, saf çalışma süresi):\n")
-    print_row("Python for döngüsü", py_time, py_result)
+    py_times, py_result = time_it(lambda: python_for_loop(N_STEPS, DT))
+    py_mean = statistics.mean(py_times)
 
-    # --- Her bulunan cihazda (CPU, varsa GPU) fori_loop ve scan'i çalıştır ---
-    device_results = {}
+    print(f"\nSonuçlar (ortalama ± std, n={REPEATS}):\n")
+    print_stats("Python for steady-state", py_times, py_result)
+
+    # --- Her bulunan cihazda (CPU, varsa GPU) fori_loop ve scan'i ölç ---
+    device_means = {}
     for name, device in devices.items():
         print(f"\n  --- {name} ---")
-        r = run_on_device(device)
-        device_results[name] = r
-        print_row(f"jax.lax.fori_loop [{name}]", r["fori_time"], r["fori_result"])
-        print_row(f"jax.lax.scan [{name}]", r["scan_time"], r["scan_result"])
+        with jax.default_device(device):
+            # İlk çağrı: JIT derlemesi + ilk çalıştırmayı birlikte içerir. Bu
+            # çağrı warmup görevini de görür (sonraki çağrılar zaten derlenmiş
+            # olacak), ama artık atılmıyor — süresi ayrıca raporlanıyor.
+            fori_first_call = timeit.timeit(lambda: jax_fori_loop(N_STEPS, DT).block_until_ready(), number=1)
+            scan_first_call = timeit.timeit(lambda: jax_scan_loop(N_STEPS, DT).block_until_ready(), number=1)
 
-    print("\nHızlanma (Python'a göre):")
-    for name, r in device_results.items():
-        print(f"  [{name}] fori_loop : {py_time / r['fori_time']:>8.1f}x daha hızlı")
-        print(f"  [{name}] scan      : {py_time / r['scan_time']:>8.1f}x daha hızlı")
+            print(f"  JAX fori_loop first call (compile+run) [{name}] : {fori_first_call*1000:.2f} ms")
+            print(f"  JAX scan first call (compile+run) [{name}]      : {scan_first_call*1000:.2f} ms")
+
+            fori_times, fori_result = time_it(lambda: jax_fori_loop(N_STEPS, DT).block_until_ready())
+            scan_times, scan_result = time_it(lambda: jax_scan_loop(N_STEPS, DT).block_until_ready())
+
+        print_stats(f"jax.lax.fori_loop steady-state [{name}]", fori_times, float(fori_result))
+        print_stats(f"jax.lax.scan steady-state [{name}]", scan_times, float(scan_result))
+
+        device_means[name] = {
+            "fori": statistics.mean(fori_times),
+            "scan": statistics.mean(scan_times),
+            "fori_first_call": fori_first_call,
+            "scan_first_call": scan_first_call,
+        }
+
+    print("\nHızlanma (Python'a göre, SADECE steady-state ortalamaları üzerinden):")
+    for name, means in device_means.items():
+        print(f"  [{name}] fori_loop : {py_mean / means['fori']:>8.1f}x daha hızlı")
+        print(f"  [{name}] scan      : {py_mean / means['scan']:>8.1f}x daha hızlı")
+
+    print("\nBreak-even (ilk çağrının derleme maliyeti kaç tekrarda amorti oluyor):")
+    for name, means in device_means.items():
+        fori_be = break_even_repeats(means["fori_first_call"], means["fori"], py_mean)
+        scan_be = break_even_repeats(means["scan_first_call"], means["scan"], py_mean)
+        fori_be_str = f"~{fori_be} tekrar" if fori_be is not None else "asla (steady-state Python'dan yavaş)"
+        scan_be_str = f"~{scan_be} tekrar" if scan_be is not None else "asla (steady-state Python'dan yavaş)"
+        print(f"  [{name}] fori_loop break-even: {fori_be_str}")
+        print(f"  [{name}] scan break-even     : {scan_be_str}")
+
     print("=" * 62)
