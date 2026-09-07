@@ -2,7 +2,7 @@
 
 JAX'in temel özelliklerini (JIT derleme, Kernel Fusion, `vmap`, otomatik türev,
 Pytree tabanlı durum yönetimi) klasik NumPy / saf Python yöntemleriyle
-kıyaslayan, birbirinden bağımsız 7 küçük deney.
+kıyaslayan, birbirinden bağımsız 8 küçük deney.
 
 ## Kurulum
 
@@ -53,6 +53,7 @@ python 04_autodiff_vs_numerical.py
 python 05_mini_mlp_pytree.py
 python 06_mnist_classifier.py
 python 07_control_flow_primitives.py
+python 08_rl_rollout_scan.py
 ```
 
 ## Deneyler
@@ -66,6 +67,7 @@ python 07_control_flow_primitives.py
 | `05_mini_mlp_pytree.py` | Pytree & Fonksiyonel Eğitim | Saf `jax.grad` + `@jax.jit` ile tek eğitim adımı |
 | `06_mnist_classifier.py` (bonus) | Uçtan uca eğitim | NumPy elle backprop vs `jax.grad` + `@jax.jit` ile MNIST sınıflandırma |
 | `07_control_flow_primitives.py` | Kontrol Akışı | `lax.cond` / `lax.switch` / `lax.while_loop` vs Python `if`/`match`/`while`, + `vmap` entegrasyonu |
+| `08_rl_rollout_scan.py` | RL rollout sistemleri | NumPy baseline vs `jit(step)`+Python döngüsü vs `lax.scan` vs `jit(scan(vmap(step)))`, iki zıt sentetik environment üzerinde |
 
 `06_mnist_classifier.py` ilk çalıştırmada MNIST verisini (~11 MB) internetten
 indirip proje içindeki `.mnist_cache/` klasörüne kaydeder; sonraki
